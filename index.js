@@ -8,6 +8,24 @@ const stripe = require("stripe")(process.env.STRIPE_SECRET);
 
 const port = process.env.PORT || 3000;
 
+
+
+const crypto = require("crypto");
+
+function generateTrackingId() {
+    const prefix = "PRCL"; // your brand prefix
+    const date = new Date().toISOString().slice(0, 10).replace(/-/g, ""); // YYYYMMDD
+    const random = crypto.randomBytes(3).toString("hex").toUpperCase(); // 6-digit hex
+
+    return `${prefix}-${date}-${random}`;
+}
+
+module.exports = generateTrackingId;
+
+
+
+
+
 //middleware
 app.use(express.json());
 app.use(cors());
@@ -31,6 +49,7 @@ async function run() {
 
     const db = client.db("zap_shift_db");
     const parcelsCollection = db.collection("parcels");
+    const paymentCollection = db.collection("payments");
 
     //------------parcels APIes--------------------
 
@@ -69,69 +88,85 @@ async function run() {
       res.send(result);
     });
 
+    //stripe payment getway api-new
 
- //stripe payment getway api-new
+    app.post("/payment-checkout-session", async (req, res) => {
+      const paymentInfo = req.body;
+      const amount = parseInt(paymentInfo.cost) * 100;
+      const session = await stripe.checkout.sessions.create({
+        line_items: [
+          {
+            price_data: {
+              currency: "usd",
+              unit_amount: amount,
+              product_data: {
+                name: `please pay for:${paymentInfo.parcelName}`,
+              },
+            },
+            quantity: 1,
+          },
+        ],
+        mode: "payment",
+        metadata: {
+          parcelId: paymentInfo.parcelId,
+          parcelName: paymentInfo.parcelName,
+        },
+        customer_email: paymentInfo.senderEmail,
+        success_url: `${process.env.SITE_DOMAIN}/dashboard/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${process.env.SITE_DOMAIN}/dashboard/payment-cancelled`,
+      });
+      res.send({ url: session.url });
+    });
 
- app.post('/payment-checkout-session',async(req,res)=>{
-  const paymentInfo=req.body;
-  const amount = parseInt(paymentInfo.cost) * 100;
-  const session = await stripe.checkout.sessions.create({
-    line_items: [
-      {
-       price_data:{
-        currency:'usd',
-        unit_amount:amount,
-        product_data:{
-          name:`please pay for:${paymentInfo.parcelName}`
+    //patch
+
+    app.patch("/payment-success", async (req, res) => {
+      const sessionId = req.query.session_id;
+
+      const session = await stripe.checkout.sessions.retrieve(sessionId);
+      console.log("session retrieve", session);
+
+      console.log("session id:", sessionId);
+
+      if (session.payment_status === "paid") {
+        const id = session.metadata.parcelId;
+        const query = { _id: new ObjectId(id) };
+        const update = {
+          $set: {
+            paymentStatus: "paid",
+            trackingId:generateTrackingId()
+          },
+        };
+
+        const result = await parcelsCollection.updateOne(query, update);
+
+        //payment history
+        const payment = {
+          amount: session.amount_total / 100,
+          currency: session.currency,
+          customer_email: session.customer_email,
+          parcelId: session.metadata.parcelId,
+          parcelName: session.metadata.parcelName,
+          transactionId: session.payment_intent,
+          paymentStatus: session.payment_status,
+          paidAt:new Date(),
+          
+        };
+
+        if (session.payment_status === "paid") {
+          const resultPayment = await paymentCollection.insertOne(payment);
+          res.send({
+            success: true,
+            modifyParcel: result,
+            paymentInfo: resultPayment,
+          });
         }
-       },
-        quantity: 1,
-      },
-    ],
-    mode: 'payment',
-    metadata:{
-      parcelId:paymentInfo.parcelId,
-    },
-    customer_email:paymentInfo.senderEmail,
-    success_url: `${process.env.SITE_DOMAIN}/dashboard/payment-success?session_id={CHECKOUT_SESSION_ID}`,
-    cancel_url: `${process.env.SITE_DOMAIN}/dashboard/payment-cancelled`,
-  });
-  res.send({url:session.url})
- })
-
-//patch
-
-app.patch('/payment-success',async(req,res)=>{
-  const sessionId=req.query.session_id;
-
-  const session=await stripe.checkout.sessions.retrieve(sessionId)
-  console.log('session retrieve',session)
-
-  console.log('session id:',sessionId);
-
-  if(session.payment_status==='paid'){
-    const id=session.metadata.parcelId;
-    const query={_id: new ObjectId(id)}
-    const update={
-      $set:{
-        paymentStatus:'paid',
-
       }
-    }
 
-    const result=await parcelsCollection.updateOne(query,update)
-    res.send(result)
-  }
-
-  res.send({
-    success:false
-  })
-})
-
-
-
-
-
+      res.send({
+        success: false,
+      });
+    });
 
     //stripe payment getway api-old
     app.post("/create-checkout-session", async (req, res) => {
@@ -160,8 +195,8 @@ app.patch('/payment-success',async(req,res)=>{
         success_url: `${process.env.SITE_DOMAIN}/dashboard/payment-success`,
         cancel_url: `${process.env.SITE_DOMAIN}/dashboard/payment-cancelled`,
       });
-      console.log(session)
-      res.send({url:session.url})
+      console.log(session);
+      res.send({ url: session.url });
     });
 
     //get api for pay specific parcel
